@@ -1,0 +1,182 @@
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index bbe79bc85..34288dfa8 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -2092,6 +2092,9 @@ def delegate_task(
+     role: Optional[str] = None,
+     background: Optional[bool] = None,
+     parent_agent=None,
++    model: Optional[str] = None,
++    provider: Optional[str] = None,
++    profile: Optional[str] = None,
+ ) -> str:
+     """
+     Spawn one or more child agents to handle delegated tasks.
+@@ -2180,6 +2183,17 @@ def delegate_task(
+     if recovered_tasks is not None:
+         tasks = recovered_tasks
+ 
++    # Per-call model/provider/profile override — applied before task building
++    # so all children in a batch inherit the same override (or each task can
++    # override individually via per-task model field in the future).
++    if model:
++        per_call_creds = _resolve_per_call_credentials(
++            model=model,
++            provider=provider or "opencode-go",
++            profile=profile or "default",
++        )
++        creds = per_call_creds
++
+     if tasks and isinstance(tasks, list):
+         if len(tasks) > max_children:
+             return tool_error(
+@@ -2843,6 +2857,102 @@ def _load_config() -> dict:
+         return {}
+ 
+ 
++# ---------------------------------------------------------------------------
++# Per-call credential resolution (model/provider/profile overrides)
++# ---------------------------------------------------------------------------
++def _resolve_per_call_credentials(
++    model: str,
++    provider: str = "opencode-go",
++    profile: str = "default",
++) -> dict:
++    """Resolve credentials for a per-call model/provider override.
++
++    Reads the specified profile's ``.env`` and ``config.yaml`` to find the
++    API key, base URL, and API mode for the given provider. Falls back to
++    the current session's environment variables when profile-specific files
++    don't exist.
++
++    When called from within a running Hermes session without explicit
++    credentials, returns the model/provider as-is so the child inherits
++    the parent's credentials.
++
++    Returns a dict: {model, provider, base_url, api_key, api_mode}
++    """
++    from pathlib import Path
++
++    hermes_home = Path.home() / ".hermes"
++
++    # Determine profile directory
++    if profile and profile != "default":
++        profile_dir = hermes_home / "profiles" / profile
++    else:
++        profile_dir = hermes_home
++
++    # Map provider names to expected env var names
++    provider_key_map = {
++        "opencode-go": "OPENCODE_GO_API_KEY",
++        "opencode-zen": "OPENCODE_ZEN_API_KEY",
++        "openrouter": "OPENROUTER_API_KEY",
++        "deepseek": "DEEPSEEK_API_KEY",
++        "anthropic": "ANTHROPIC_API_KEY",
++        "openai": "OPENAI_API_KEY",
++        "minimax": "MINIMAX_API_KEY",
++        "kimi": "KIMI_API_KEY",
++        "xiaomi": "XIAOMI_API_KEY",
++        "dashscope": "DASHSCOPE_API_KEY",
++        "github": "GITHUB_API_KEY",
++        "google": "GOOGLE_API_KEY",
++        "mistral": "MISTRAL_API_KEY",
++        "groq": "GROQ_API_KEY",
++        "together": "TOGETHER_API_KEY",
++    }
++
++    api_key_var = provider_key_map.get(provider, f"{provider.upper()}_API_KEY")
++
++    # Read env from .env files (profile first, then global)
++    env_vars = {}
++    for env_path in [profile_dir / ".env", hermes_home / ".env"]:
++        if env_path.exists():
++            try:
++                with open(env_path) as f:
++                    for line in f:
++                        line = line.strip()
++                        if "=" in line and not line.startswith("#"):
++                            key, _, val = line.partition("=")
++                            env_vars[key.strip()] = val.strip().strip("'\"")
++            except OSError:
++                pass
++
++    api_key = env_vars.get(api_key_var, "") or os.environ.get(api_key_var, "")
++
++    # Read config for base_url and api_mode
++    base_url = ""
++    api_mode = ""
++    config_path = profile_dir / "config.yaml"
++    if config_path.exists():
++        try:
++            import yaml
++
++            with open(config_path) as f:
++                cfg = yaml.safe_load(f) or {}
++
++            providers_cfg = cfg.get("providers", {}) or {}
++            provider_cfg = providers_cfg.get(provider, {}) or {}
++            if isinstance(provider_cfg, dict):
++                base_url = provider_cfg.get("base_url", "") or ""
++                api_mode = provider_cfg.get("api_mode", "") or ""
++        except Exception:
++            pass
++
++    return {
++        "model": model,
++        "provider": provider,
++        "base_url": base_url or None,
++        "api_key": api_key or None,
++        "api_mode": api_mode or None,
++    }
++
++
+ # ---------------------------------------------------------------------------
+ # OpenAI Function-Calling Schema
+ # ---------------------------------------------------------------------------
+@@ -3150,6 +3260,36 @@ DELEGATE_TASK_SCHEMA = {
+                     "Leave empty unless acp_command is explicitly provided."
+                 ),
+             },
++            "model": {
++                "type": "string",
++                "description": (
++                    "Optional model override for this subagent. "
++                    "When set, the subagent uses this model instead of inheriting "
++                    "the parent's model. Examples: deepseek-v4-flash, "
++                    "mimo-v2-5-pro, qwen-3.7-plus, minimax-m3. "
++                    "Must be used together with 'provider' to specify which "
++                    "provider serves the model. "
++                    "Overrides delegation.model in config.yaml."
++                ),
++            },
++            "provider": {
++                "type": "string",
++                "description": (
++                    "Optional provider override for this subagent. "
++                    "Required when 'model' is set. Examples: opencode-go, "
++                    "openrouter, deepseek, anthropic. "
++                    "Overrides delegation.provider in config.yaml."
++                ),
++            },
++            "profile": {
++                "type": "string",
++                "description": (
++                    "Optional Hermes profile to use for credential resolution. "
++                    "When set, the subagent reads API keys and config from the "
++                    "specified profile's .env and config.yaml. "
++                    "Examples: default, coder, dr-k."
++                ),
++            },
+         },
+         "required": [],
+     },
+@@ -3189,6 +3329,9 @@ registry.register(
+         acp_command=args.get("acp_command"),
+         acp_args=args.get("acp_args"),
+         role=args.get("role"),
++        model=args.get("model"),
++        provider=args.get("provider"),
++        profile=args.get("profile"),
+         background=_model_background_value(args, kw.get("parent_agent")),
+         parent_agent=kw.get("parent_agent"),
+     ),

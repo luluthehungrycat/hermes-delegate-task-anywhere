@@ -1,0 +1,1023 @@
+From 3513ea7b4af0871a249bf05581a0e7e9375e468b Mon Sep 17 00:00:00 2001
+From: luluthehungrycat <luluthehungrycat@github.com>
+Date: Wed, 15 Jul 2026 14:32:51 +0200
+Subject: [PATCH 1/5] feat(tools): add per-call model/provider/profile
+ overrides to delegate_task
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds three new optional parameters to the delegate_task tool that let
+the model (or a human caller) override the model, provider, and profile
+used for subagents on a per-call basis.
+
+- model: specify which model the subagent should use
+- provider: specify which provider serves the model (required with model)
+- profile: specify which Hermes profile's credentials to resolve from
+
+When model is provided, _resolve_per_call_credentials() reads the
+specified profile's .env and config.yaml to resolve the API key, base
+URL, and API mode — bypassing the delegation config block entirely.
+When model is omitted, the existing delegation config path is used
+unchanged.
+
+The new fields are exposed in the tool schema so the model sees them,
+and threaded through the registry handler into the delegate_task()
+function signature.
+---
+ tools/delegate_tool.py | 169 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 169 insertions(+)
+
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index c8f6fa529..51ef729e0 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -2374,6 +2374,9 @@ def delegate_task(
+     role: Optional[str] = None,
+     background: Optional[bool] = None,
+     parent_agent=None,
++    model: Optional[str] = None,
++    provider: Optional[str] = None,
++    profile: Optional[str] = None,
+ ) -> str:
+     """
+     Spawn one or more child agents to handle delegated tasks.
+@@ -2454,6 +2457,19 @@ def delegate_task(
+     except ValueError as exc:
+         return tool_error(str(exc))
+ 
++    # Per-call model/provider/profile override — applied before task building
++    # so all children in a batch inherit the same override. When model is set,
++    # resolves credentials from the specified profile's .env and config.yaml,
++    # bypassing the delegation config block entirely.
++    # provider defaults to None so _build_child_agent inherits from the parent.
++    if model:
++        per_call_creds = _resolve_per_call_credentials(
++            model=model,
++            provider=provider,
++            profile=profile,
++        )
++        creds = per_call_creds
++
+     # Normalize to task list
+     max_children = _get_max_concurrent_children()
+     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
+@@ -3166,6 +3182,127 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+     }
+ 
+ 
++# ---------------------------------------------------------------------------
++# Per-call credential resolution (model/provider/profile overrides)
++# ---------------------------------------------------------------------------
++def _resolve_per_call_credentials(
++    model: str,
++    provider: Optional[str] = None,
++    profile: Optional[str] = None,
++) -> dict:
++    """Resolve credentials for a per-call model/provider override.
++
++    Reads the specified profile's ``.env`` and ``config.yaml`` to find the
++    API key, base URL, and API mode for the given provider. Falls back to
++    the current session's environment variables when profile-specific files
++    don't exist.
++
++    When provider is None, returns only the model (no credential override)
++    so _build_child_agent inherits the parent's provider and credentials.
++    When profile is None, defaults to the active profile's directories.
++
++    When called from within a running Hermes session without explicit
++    credentials, returns the model/provider as-is so the child inherits
++    the parent's credentials.
++
++    Returns a dict: {model, provider, base_url, api_key, api_mode}
++    Compatible with the shape returned by _resolve_delegation_credentials
++    so the caller can swap the result in.
++    """
++    from pathlib import Path
++
++    hermes_home = Path.home() / ".hermes"
++
++    # Determine profile directory
++    if profile and profile != "default":
++        profile_dir = hermes_home / "profiles" / profile
++    else:
++        profile_dir = hermes_home
++
++    # If no provider is specified, return the model override only — the child
++    # inherits the parent's provider, credentials, and config.
++    if not provider:
++        return {
++            "model": model,
++            "provider": None,
++            "base_url": None,
++            "api_key": None,
++            "api_mode": None,
++            "request_overrides": None,
++            "max_output_tokens": None,
++            "command": None,
++            "args": None,
++        }
++
++    # Map provider names to expected env var names
++    provider_key_map = {
++        "opencode-go": "OPENCODE_GO_API_KEY",
++        "opencode-zen": "OPENCODE_ZEN_API_KEY",
++        "openrouter": "OPENROUTER_API_KEY",
++        "deepseek": "DEEPSEEK_API_KEY",
++        "anthropic": "ANTHROPIC_API_KEY",
++        "openai": "OPENAI_API_KEY",
++        "minimax": "MINIMAX_API_KEY",
++        "kimi": "KIMI_API_KEY",
++        "xiaomi": "XIAOMI_API_KEY",
++        "dashscope": "DASHSCOPE_API_KEY",
++        "github": "GITHUB_API_KEY",
++        "google": "GOOGLE_API_KEY",
++        "mistral": "MISTRAL_API_KEY",
++        "groq": "GROQ_API_KEY",
++        "together": "TOGETHER_API_KEY",
++    }
++
++    api_key_var = provider_key_map.get(provider, f"{provider.upper()}_API_KEY")  # provider is non-None here (early return above)
++
++    # Read env from .env files (profile first, then global)
++    env_vars = {}
++    for env_path in [profile_dir / ".env", hermes_home / ".env"]:
++        if env_path.exists():
++            try:
++                with open(env_path) as f:
++                    for line in f:
++                        line = line.strip()
++                        if "=" in line and not line.startswith("#"):
++                            key, _, val = line.partition("=")
++                            env_vars[key.strip()] = val.strip().strip("'\"")
++            except OSError:
++                pass
++
++    api_key = env_vars.get(api_key_var, "") or os.environ.get(api_key_var, "")
++
++    # Read config for base_url and api_mode
++    base_url = ""
++    api_mode = ""
++    config_path = profile_dir / "config.yaml"
++    if config_path.exists():
++        try:
++            import yaml
++
++            with open(config_path) as f:
++                cfg = yaml.safe_load(f) or {}
++
++            providers_cfg = cfg.get("providers", {}) or {}
++            provider_cfg = providers_cfg.get(provider, {}) or {}
++            if isinstance(provider_cfg, dict):
++                base_url = provider_cfg.get("base_url", "") or ""
++                api_mode = provider_cfg.get("api_mode", "") or ""
++        except Exception:
++            pass
++
++    return {
++        "model": model,
++        "provider": provider,
++        "base_url": base_url or None,
++        "api_key": api_key or None,
++        "api_mode": api_mode or None,
++        "request_overrides": None,
++        "max_output_tokens": None,
++        "command": None,
++        "args": None,
++    }
++
++
+ def _load_config() -> dict:
+     """Load delegation config from the active Hermes config.
+ 
+@@ -3461,6 +3598,35 @@ DELEGATE_TASK_SCHEMA = {
+                     "compatibility."
+                 ),
+             },
++            "model": {
++                "type": "string",
++                "description": (
++                    "Optional model override for this subagent. "
++                    "When set, the subagent uses this model instead of inheriting "
++                    "the parent's model or the delegation config. "
++                    "Examples: deepseek-v4-flash, mimo-v2-5-pro, qwen-3.7-plus, minimax-m3. "
++                    "When used without 'provider', the child inherits the parent's "
++                    "provider and credentials (model-only override)."
++                ),
++            },
++            "provider": {
++                "type": "string",
++                "description": (
++                    "Optional provider override for this subagent. "
++                    "When set together with 'model', specifies which "
++                    "provider serves the model. Examples: opencode-go, "
++                    "openrouter, deepseek, anthropic."
++                ),
++            },
++            "profile": {
++                "type": "string",
++                "description": (
++                    "Optional Hermes profile used for credential resolution. "
++                    "When set, the subagent reads API keys and config from the "
++                    "specified profile's .env and config.yaml. "
++                    "Examples: default, coder, dr-k."
++                ),
++            },
+         },
+         "required": [],
+     },
+@@ -3521,6 +3687,9 @@ registry.register(
+         role=args.get("role"),
+         background=_model_background_value(args, kw.get("parent_agent")),
+         parent_agent=kw.get("parent_agent"),
++        model=args.get("model"),
++        provider=args.get("provider"),
++        profile=args.get("profile"),
+     ),
+     check_fn=check_delegate_requirements,
+     emoji="🔀",
+-- 
+2.47.3
+
+
+From 92731807c5b0a22a36d765d91fe650e06d49a3ac Mon Sep 17 00:00:00 2001
+From: Hermee <hermes@vmd195583.contaboserver.net>
+Date: Wed, 15 Jul 2026 14:57:46 +0200
+Subject: [PATCH 2/5] feat(tools): add per-call model/provider/profile
+ overrides to delegate_task
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds three new optional parameters (model, provider, profile) to the
+delegate_task tool that let the model override the model, provider, and
+profile used for subagents on a per-call basis.
+
+- model: specify which model the subagent should use
+- provider: optional — when omitted, child inherits parent's provider
+  and credentials (model-only override)
+- profile: optional — when omitted, uses active profile's directories
+
+When model is provided, _resolve_per_call_credentials() reads the
+specified profile's .env and config.yaml to resolve the API key, base
+URL, and API mode, bypassing the delegation config block entirely.
+When model is omitted, the existing delegation config path is unchanged.
+
+Includes 6 unit tests covering: model-only override (no provider),
+model+provider resolution, credential dict shape compatibility,
+signature acceptance, and schema field exposure.
+---
+ tests/tools/test_delegate.py | 253 +++++++++++++++++++++++++++++++++++
+ tools/delegate_tool.py       |  70 ++++++++--
+ 2 files changed, 310 insertions(+), 13 deletions(-)
+
+diff --git a/tests/tools/test_delegate.py b/tests/tools/test_delegate.py
+index 0fe6e0028..1efadc992 100644
+--- a/tests/tools/test_delegate.py
++++ b/tests/tools/test_delegate.py
+@@ -35,6 +35,7 @@ from tools.delegate_tool import (
+     _resolve_child_credential_pool,
+     _resolve_delegation_credentials,
+     _inherit_parent_base_url,
++    _resolve_per_call_credentials,
+ )
+ 
+ 
+@@ -3157,3 +3158,255 @@ class TestFallbackModelInheritance(unittest.TestCase):
+ 
+ if __name__ == "__main__":
+     unittest.main()
++
++
++class TestPerCallCredentialOverride(unittest.TestCase):
++    """Tests for _resolve_per_call_credentials and the per-call override path."""
++
++    def test_resolve_model_only_no_provider(self):
++        """When provider is None, returns model-only with None credentials
++        so _build_child_agent inherits from the parent."""
++        result = _resolve_per_call_credentials(model="deepseek-v4-flash")
++        self.assertEqual(result["model"], "deepseek-v4-flash")
++        self.assertIsNone(result["provider"])
++        self.assertIsNone(result["base_url"])
++        self.assertIsNone(result["api_key"])
++        self.assertIsNone(result["api_mode"])
++        self.assertIsNone(result["request_overrides"])
++        self.assertIsNone(result["max_output_tokens"])
++
++    def test_resolve_model_with_provider_no_profile(self):
++        """When provider is set but profile is None, attempts to resolve
++        from default profile directories. Credential fields may be None
++        if no .env/config.yaml is configured."""
++        result = _resolve_per_call_credentials(
++            model="deepseek-v4-flash",
++            provider="opencode-go",
++        )
++        self.assertEqual(result["model"], "deepseek-v4-flash")
++        self.assertEqual(result["provider"], "opencode-go")
++        # base_url/api_key/api_mode are None when no .env is configured
++
++    def test_resolve_model_with_provider_explicitly(self):
++        """Passing both model and provider returns both in the result."""
++        result = _resolve_per_call_credentials(
++            model="mimo-v2-5-pro",
++            provider="opencode-go",
++            profile="default",
++        )
++        self.assertEqual(result["model"], "mimo-v2-5-pro")
++        self.assertEqual(result["provider"], "opencode-go")
++
++    def test_resolve_returns_dict_compatible_with_delegation_creds(self):
++        """The return shape matches _resolve_delegation_credentials
++        key-for-key so the caller can merge or swap the result."""
++        result = _resolve_per_call_credentials(
++            model="test-model",
++            provider="test-provider",
++        )
++        required_keys = {
++            "model", "provider", "base_url", "api_key", "api_mode",
++            "request_overrides", "max_output_tokens", "command", "args",
++        }
++        self.assertEqual(set(result.keys()), required_keys)
++        # All keys beyond model/provider are None when no config is found
++        for key in ("base_url", "api_key", "api_mode"):
++            self.assertIsNone(result[key], f"{key} should be None")
++
++    def test_resolve_nonexistent_profile_falls_back(self):
++        """When the named profile doesn't exist, the function degrades
++        gracefully to the default profile rather than crashing."""
++        result = _resolve_per_call_credentials(
++            model="test-model",
++            provider="opencode-go",
++            profile="nonexistent-profile-that-will-never-exist-12345",
++        )
++        self.assertEqual(result["model"], "test-model")
++        self.assertEqual(result["provider"], "opencode-go")
++        # Credential fields for base_url/api_mode come from config.yaml
++        # (not .env), so they should be None for non-existent profiles
++        self.assertIsNone(result["base_url"])
++        self.assertIsNone(result["api_mode"])
++
++    def test_empty_model_returns_empty_model_dict(self):
++        """When model is an empty string, _resolve_per_call_credentials
++        returns it as-is. The actual guard (if model: in delegate_task())
++        prevents this path from being reached with empty model."""
++        result = _resolve_per_call_credentials(model="")
++        self.assertEqual(result["model"], "")
++        # No overrides triggered — all creds are None
++        self.assertIsNone(result["provider"])
++
++    def test_delegate_task_accepts_model_param(self):
++        """delegate_task must accept model/provider/profile in its signature."""
++        import inspect
++
++        sig = inspect.signature(delegate_task)
++        self.assertIn("model", sig.parameters)
++        self.assertIn("provider", sig.parameters)
++        self.assertIn("profile", sig.parameters)
++
++    def test_DELEGATE_TASK_SCHEMA_has_model_fields(self):
++        """The static schema must advertise model/provider/profile."""
++        schema_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
++        self.assertIn("model", schema_props)
++        self.assertIn("provider", schema_props)
++        self.assertIn("profile", schema_props)
++
++
++class TestEndToEndOverride(unittest.TestCase):
++    """End-to-end tests exercising delegate_task with per-call overrides.
++
++    Uses mocked _build_child_agent to verify the credential merge and
++    override passthrough logic without needing a real LLM or API keys.
++    Runs in CI as standard unit tests.
++    """
++
++    def _make_mock_parent(self, depth=0):
++        """Create a mock parent agent with the fields delegate_task expects."""
++        parent = MagicMock()
++        parent.base_url = "https://openrouter.ai/api/v1"
++        parent.api_key = "sk-parent-test-key-12345"
++        parent.provider = "openrouter"
++        parent.api_mode = "chat_completions"
++        parent.model = "anthropic/claude-sonnet-4"
++        parent.platform = "cli"
++        parent.providers_allowed = None
++        parent.providers_ignored = None
++        parent.providers_order = None
++        parent.provider_sort = None
++        parent.provider_require_parameters = False
++        parent.provider_data_collection = ""
++        parent.openrouter_min_coding_score = None
++        parent.max_iterations = 50
++        parent.max_tokens = None
++        parent._delegate_depth = depth
++        parent._delegate_spinner = None
++        parent._fallback_chain = None
++        parent._print_fn = None
++        parent.session_id = "test-session-001"
++        parent._client_kwargs = {}
++        parent._safe_print = lambda x: None
++        return parent
++
++    def setUp(self):
++        self.parent = self._make_mock_parent()
++
++    @patch("tools.delegate_tool._build_child_agent")
++    @patch("tools.delegate_tool._run_single_child")
++    def test_explicit_model_provider_profile(self, mock_run, mock_build):
++        """Full override: model + provider + profile."""
++        mock_child = MagicMock()
++        mock_child.session_prompt_tokens = 100
++        mock_child.session_completion_tokens = 50
++        mock_child.session_estimated_cost_usd = 0.01
++        mock_child.model = "deepseek-v4-flash"
++        mock_build.return_value = mock_child
++        mock_run.return_value = {"status": "completed", "summary": "done"}
++
++        result = delegate_task(
++            goal="Test explicit override",
++            model="deepseek-v4-flash",
++            provider="opencode-go",
++            profile="default",
++            parent_agent=self.parent,
++        )
++
++        result_data = json.loads(result)
++        mock_build.assert_called_once()
++        call_kwargs = mock_build.call_args[1]
++        self.assertEqual(
++            call_kwargs["model"], "deepseek-v4-flash",
++            "Child model should be the overridden model"
++        )
++
++    @patch("tools.delegate_tool._build_child_agent")
++    @patch("tools.delegate_tool._run_single_child")
++    def test_model_only_override_inherits_provider(self, mock_run, mock_build):
++        """Model-only: model set, provider not set.
++
++        override_provider should be None so _build_child_agent inherits
++        from the parent via its ``or`` fallback pattern."""
++        mock_child = MagicMock()
++        mock_child.session_prompt_tokens = 100
++        mock_child.session_completion_tokens = 50
++        mock_child.session_estimated_cost_usd = 0.01
++        mock_child.model = "deepseek-v4-flash"
++        mock_build.return_value = mock_child
++        mock_run.return_value = {"status": "completed", "summary": "done"}
++
++        result = delegate_task(
++            goal="Test model-only override",
++            model="deepseek-v4-flash",
++            parent_agent=self.parent,
++        )
++
++        result_data = json.loads(result)
++        mock_build.assert_called_once()
++        call_kwargs = mock_build.call_args[1]
++        self.assertEqual(
++            call_kwargs["model"], "deepseek-v4-flash",
++            "Child model should be the overridden model"
++        )
++        self.assertIsNone(
++            call_kwargs.get("override_provider"),
++            "override_provider should be None — _build_child_agent "
++            "inherits from parent via `override_provider or parent.provider`"
++        )
++
++    @patch("tools.delegate_tool._build_child_agent")
++    @patch("tools.delegate_tool._run_single_child")
++    def test_no_override_passes_none_to_child_builder(self, mock_run, mock_build):
++        """No override: creds['model'] is None, passed to _build_child_agent
++        which handles parent inheritance internally."""
++        mock_child = MagicMock()
++        mock_child.session_prompt_tokens = 100
++        mock_child.session_completion_tokens = 50
++        mock_child.session_estimated_cost_usd = 0.01
++        mock_build.return_value = mock_child
++        mock_run.return_value = {"status": "completed", "summary": "done"}
++
++        result = delegate_task(
++            goal="Test no override",
++            parent_agent=self.parent,
++        )
++
++        result_data = json.loads(result)
++        mock_build.assert_called_once()
++        call_kwargs = mock_build.call_args[1]
++        self.assertIsNone(
++            call_kwargs["model"],
++            "Child model should be None when no override — "
++            "_build_child_agent handles parent inheritance"
++        )
++
++    def test_credential_merge_preserves_existing_keys(self):
++        """Merge semantics: per_call_creds with None values should not
++        clobber existing delegation creds for provider/api_key/etc."""
++        per_call = _resolve_per_call_credentials(
++            model="deepseek-v4-flash",
++        )
++        self.assertEqual(per_call["model"], "deepseek-v4-flash")
++        self.assertIsNone(per_call["provider"])
++        self.assertIsNone(per_call["base_url"])
++        self.assertIsNone(per_call["api_key"])
++        self.assertIsNone(per_call["api_mode"])
++
++        existing_creds = {
++            "model": "anthropic/claude-sonnet-4",
++            "provider": "openrouter",
++            "base_url": "https://openrouter.ai/api/v1",
++            "api_key": "sk-existing-key",
++            "api_mode": "chat_completions",
++        }
++
++        for key, value in per_call.items():
++            if value is not None:
++                existing_creds[key] = value
++        existing_creds["model"] = per_call["model"]
++
++        self.assertEqual(existing_creds["model"], "deepseek-v4-flash")
++        self.assertEqual(existing_creds["provider"], "openrouter")
++        self.assertEqual(existing_creds["base_url"], "https://openrouter.ai/api/v1")
++        self.assertEqual(existing_creds["api_key"], "sk-existing-key")
++        self.assertEqual(existing_creds["api_mode"], "chat_completions")
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 51ef729e0..bd33a0453 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -28,7 +28,7 @@ from concurrent.futures import (
+     ThreadPoolExecutor,
+     TimeoutError as FuturesTimeoutError,
+ )
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, List, Optional, TypedDict
+ 
+ from toolsets import TOOLSETS
+ 
+@@ -2459,16 +2459,23 @@ def delegate_task(
+ 
+     # Per-call model/provider/profile override — applied before task building
+     # so all children in a batch inherit the same override. When model is set,
+-    # resolves credentials from the specified profile's .env and config.yaml,
+-    # bypassing the delegation config block entirely.
+-    # provider defaults to None so _build_child_agent inherits from the parent.
++    # resolves credentials from the specified profile's .env and config.yaml.
++    # Uses a merge approach: only overrides the keys that _resolve_per_call_credentials
++    # returns non-None, preserving the existing creds for everything else. This
++    # ensures model-only overrides (no provider) still inherit the parent's
++    # provider, base_url, api_key, and api_mode from the delegation config.
+     if model:
+         per_call_creds = _resolve_per_call_credentials(
+             model=model,
+             provider=provider,
+             profile=profile,
+         )
+-        creds = per_call_creds
++        # Merge: per_call_creds values win only when non-None
++        for key, value in per_call_creds.items():
++            if value is not None:
++                creds[key] = value
++        # model is always set (guaranteed by the if model: guard above)
++        creds["model"] = per_call_creds["model"]
+ 
+     # Normalize to task list
+     max_children = _get_max_concurrent_children()
+@@ -3185,11 +3192,30 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+ # ---------------------------------------------------------------------------
+ # Per-call credential resolution (model/provider/profile overrides)
+ # ---------------------------------------------------------------------------
++class _CredentialOverrideDict(TypedDict, total=True):
++    """Return type for _resolve_per_call_credentials().
++
++    All keys are always present in the returned dict. Keys with None
++    values should be inherited from the parent/delegation config.
++    Matches the shape returned by _resolve_delegation_credentials()
++    for compatibility.
++    """
++    model: str
++    provider: Optional[str]
++    base_url: Optional[str]
++    api_key: Optional[str]
++    api_mode: Optional[str]
++    request_overrides: Optional[Dict[str, Any]]
++    max_output_tokens: Optional[int]
++    command: Optional[str]
++    args: Optional[List[str]]
++
++
+ def _resolve_per_call_credentials(
+     model: str,
+     provider: Optional[str] = None,
+     profile: Optional[str] = None,
+-) -> dict:
++) -> _CredentialOverrideDict:
+     """Resolve credentials for a per-call model/provider override.
+ 
+     Reads the specified profile's ``.env`` and ``config.yaml`` to find the
+@@ -3208,6 +3234,17 @@ def _resolve_per_call_credentials(
+     Returns a dict: {model, provider, base_url, api_key, api_mode}
+     Compatible with the shape returned by _resolve_delegation_credentials
+     so the caller can swap the result in.
++
++    Examples:
++        >>> _resolve_per_call_credentials(model="deepseek-v4-flash")
++        {...}  # model-only override, inherits parent's provider
++
++        >>> _resolve_per_call_credentials(
++        ...     model="mimo-v2-5-pro",
++        ...     provider="opencode-go",
++        ...     profile="coder",
++        ... )
++        {...}  # full override: model, provider, and profile credentials
+     """
+     from pathlib import Path
+ 
+@@ -3216,6 +3253,14 @@ def _resolve_per_call_credentials(
+     # Determine profile directory
+     if profile and profile != "default":
+         profile_dir = hermes_home / "profiles" / profile
++        if not profile_dir.exists():
++            logger.warning(
++                "Per-call override profile directory not found: %s. "
++                "Falling back to default profile directories. "
++                "Check that the profile name is correct and exists under ~/.hermes/profiles/.",
++                profile_dir,
++            )
++            profile_dir = hermes_home
+     else:
+         profile_dir = hermes_home
+ 
+@@ -3255,17 +3300,16 @@ def _resolve_per_call_credentials(
+ 
+     api_key_var = provider_key_map.get(provider, f"{provider.upper()}_API_KEY")  # provider is non-None here (early return above)
+ 
+-    # Read env from .env files (profile first, then global)
++    # Read env from .env files using python-dotenv (bundled with Hermes)
++    # to handle edge cases: values with = signs, quoted values, comments,
++    # export prefix, etc.
++    from dotenv import dotenv_values
++
+     env_vars = {}
+     for env_path in [profile_dir / ".env", hermes_home / ".env"]:
+         if env_path.exists():
+             try:
+-                with open(env_path) as f:
+-                    for line in f:
+-                        line = line.strip()
+-                        if "=" in line and not line.startswith("#"):
+-                            key, _, val = line.partition("=")
+-                            env_vars[key.strip()] = val.strip().strip("'\"")
++                env_vars.update(dotenv_values(str(env_path)))
+             except OSError:
+                 pass
+ 
+-- 
+2.47.3
+
+
+From 6c2b11df9c5eab471117192148c74946d35a83e7 Mon Sep 17 00:00:00 2001
+From: Hermee <hermes@vmd195583.contaboserver.net>
+Date: Wed, 15 Jul 2026 16:04:06 +0200
+Subject: [PATCH 3/5] fix: use generic profile name in schema description
+
+---
+ tools/delegate_tool.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index bd33a0453..3563b5e19 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -3668,7 +3668,7 @@ DELEGATE_TASK_SCHEMA = {
+                     "Optional Hermes profile used for credential resolution. "
+                     "When set, the subagent reads API keys and config from the "
+                     "specified profile's .env and config.yaml. "
+-                    "Examples: default, coder, dr-k."
++                    "Examples: default, coder, worker."
+                 ),
+             },
+         },
+-- 
+2.47.3
+
+
+From 5000ea1737644dbaa04a0b5244e8bd0018596a08 Mon Sep 17 00:00:00 2001
+From: Hermee <hermes@vmd195583.contaboserver.net>
+Date: Wed, 15 Jul 2026 16:13:15 +0200
+Subject: [PATCH 4/5] fix: address OpenCode v3 review nits
+
+- Move from dotenv import dotenv_values to module level (was lazy inside fn)
+- Add result_data assertions in E2E tests (was dead store)
+- Add explicit assertIsNone for base_url, api_mode in test_resolve_model_with_provider_no_profile
+---
+ tests/tools/test_delegate.py | 13 ++++++++++---
+ tools/delegate_tool.py       |  5 ++---
+ 2 files changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/tests/tools/test_delegate.py b/tests/tools/test_delegate.py
+index 1efadc992..bd4d007fa 100644
+--- a/tests/tools/test_delegate.py
++++ b/tests/tools/test_delegate.py
+@@ -3177,15 +3177,19 @@ class TestPerCallCredentialOverride(unittest.TestCase):
+ 
+     def test_resolve_model_with_provider_no_profile(self):
+         """When provider is set but profile is None, attempts to resolve
+-        from default profile directories. Credential fields may be None
+-        if no .env/config.yaml is configured."""
++        from default profile directories. Credential fields are None
++        when no .env/config.yaml is configured."""
+         result = _resolve_per_call_credentials(
+             model="deepseek-v4-flash",
+             provider="opencode-go",
+         )
+         self.assertEqual(result["model"], "deepseek-v4-flash")
+         self.assertEqual(result["provider"], "opencode-go")
+-        # base_url/api_key/api_mode are None when no .env is configured
++        # base_url and api_mode come from config.yaml (not .env),
++        # so they should be None in a test environment.
++        # api_key may resolve from the global .env — that's fine.
++        self.assertIsNone(result["base_url"])
++        self.assertIsNone(result["api_mode"])
+ 
+     def test_resolve_model_with_provider_explicitly(self):
+         """Passing both model and provider returns both in the result."""
+@@ -3313,6 +3317,7 @@ class TestEndToEndOverride(unittest.TestCase):
+         )
+ 
+         result_data = json.loads(result)
++        self.assertEqual(result_data["results"][0]["status"], "completed")
+         mock_build.assert_called_once()
+         call_kwargs = mock_build.call_args[1]
+         self.assertEqual(
+@@ -3342,6 +3347,7 @@ class TestEndToEndOverride(unittest.TestCase):
+         )
+ 
+         result_data = json.loads(result)
++        self.assertEqual(result_data["results"][0]["status"], "completed")
+         mock_build.assert_called_once()
+         call_kwargs = mock_build.call_args[1]
+         self.assertEqual(
+@@ -3372,6 +3378,7 @@ class TestEndToEndOverride(unittest.TestCase):
+         )
+ 
+         result_data = json.loads(result)
++        self.assertEqual(result_data["results"][0]["status"], "completed")
+         mock_build.assert_called_once()
+         call_kwargs = mock_build.call_args[1]
+         self.assertIsNone(
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 3563b5e19..081184418 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -30,6 +30,8 @@ from concurrent.futures import (
+ )
+ from typing import Any, Dict, List, Optional, TypedDict
+ 
++from dotenv import dotenv_values
++
+ from toolsets import TOOLSETS
+ 
+ # Sentinel value used by the runtime provider system for providers that are
+@@ -3301,9 +3303,6 @@ def _resolve_per_call_credentials(
+     api_key_var = provider_key_map.get(provider, f"{provider.upper()}_API_KEY")  # provider is non-None here (early return above)
+ 
+     # Read env from .env files using python-dotenv (bundled with Hermes)
+-    # to handle edge cases: values with = signs, quoted values, comments,
+-    # export prefix, etc.
+-    from dotenv import dotenv_values
+ 
+     env_vars = {}
+     for env_path in [profile_dir / ".env", hermes_home / ".env"]:
+-- 
+2.47.3
+
+
+From 9fcffb7cb9e343bf0d4ec28e84c596f4dcf41c09 Mon Sep 17 00:00:00 2001
+From: Hermee <hermes@vmd195583.contaboserver.net>
+Date: Wed, 15 Jul 2026 17:04:35 +0200
+Subject: [PATCH 5/5] feat: add delegation.allow_cross_profile config key and
+ docs
+
+---
+ hermes_cli/config.py                     |   8 ++
+ tests/tools/test_delegate.py             | 116 +++++++++++++++++++++++
+ tools/delegate_tool.py                   |  26 ++++-
+ website/docs/user-guide/configuration.md |   3 +
+ 4 files changed, 149 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index a47ba24ea..bef0d274c 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -2298,6 +2298,14 @@ DEFAULT_CONFIG = {
+         # Flip to true only if you trust delegated work to run dangerous cmds
+         # without human review (cron pipelines, batch automation, etc.).
+         "subagent_auto_approve": False,
++
++        # Cross-profile guard: controls whether delegate_task accepts an explicit
++        # profile argument for credential resolution. When true (default), the
++        # model can route subagents to any profile's credentials — useful for
++        # single-user setups with multiple profiles (e.g. "coder", "researcher").
++        # When false, any caller-supplied profile is rejected with a tool error
++        # to prevent credential cross-access in multi-tenant deployments.
++        "allow_cross_profile": True,
+     },
+ 
+     # Ephemeral prefill messages file — JSON list of {role, content} dicts
+diff --git a/tests/tools/test_delegate.py b/tests/tools/test_delegate.py
+index bd4d007fa..a0962cb93 100644
+--- a/tests/tools/test_delegate.py
++++ b/tests/tools/test_delegate.py
+@@ -3417,3 +3417,119 @@ class TestEndToEndOverride(unittest.TestCase):
+         self.assertEqual(existing_creds["base_url"], "https://openrouter.ai/api/v1")
+         self.assertEqual(existing_creds["api_key"], "sk-existing-key")
+         self.assertEqual(existing_creds["api_mode"], "chat_completions")
++
++
++class TestCrossProfileGuard(unittest.TestCase):
++    """Tests for the delegation.allow_cross_profile config guard."""
++
++    def setUp(self):
++        self.parent = MagicMock()
++        self.parent.base_url = "https://openrouter.ai/api/v1"
++        self.parent.api_key = "sk-parent-test-key"
++        self.parent.provider = "openrouter"
++        self.parent.api_mode = "chat_completions"
++        self.parent.model = "anthropic/claude-sonnet-4"
++        self.parent.platform = "cli"
++        self.parent.max_iterations = 50
++        self.parent._delegate_depth = 0
++        self.parent.session_id = "test-session"
++        self.parent._fallback_chain = None
++        self.parent._safe_print = lambda x: None
++        self.parent._client_kwargs = {}
++
++    @patch("tools.delegate_tool._resolve_delegation_credentials")
++    def test_cross_profile_disabled_with_profile_returns_error(self, mock_resolve):
++        """When allow_cross_profile is false and profile is set, reject."""
++        mock_resolve.return_value = {"model": None, "provider": None, "base_url": None,
++                                     "api_key": None, "api_mode": None, "request_overrides": None,
++                                     "max_output_tokens": None, "command": None, "args": None}
++
++        with patch("tools.delegate_tool._load_config",
++                   return_value={"allow_cross_profile": False}):
++            result = delegate_task(
++                goal="Test cross-profile rejected",
++                model="deepseek-v4-flash",
++                provider="opencode-go",
++                profile="coder",
++                parent_agent=self.parent,
++            )
++        self.assertIn("Cross-profile delegation is disabled", result)
++
++    @patch("tools.delegate_tool._resolve_delegation_credentials")
++    @patch("tools.delegate_tool._build_child_agent")
++    @patch("tools.delegate_tool._run_single_child")
++    def test_cross_profile_enabled_with_profile_succeeds(self, mock_run, mock_build, mock_resolve):
++        """When allow_cross_profile is true (or unset) and profile is set, allow."""
++        mock_resolve.return_value = {"model": None, "provider": None, "base_url": None,
++                                     "api_key": None, "api_mode": None, "request_overrides": None,
++                                     "max_output_tokens": None, "command": None, "args": None}
++        mock_child = MagicMock()
++        mock_child.session_prompt_tokens = 100
++        mock_child.session_completion_tokens = 50
++        mock_child.session_estimated_cost_usd = 0.01
++        mock_build.return_value = mock_child
++        mock_run.return_value = {"status": "completed", "summary": "done"}
++
++        with patch("tools.delegate_tool._load_config",
++                   return_value={"allow_cross_profile": True}):
++            result = delegate_task(
++                goal="Test cross-profile allowed",
++                model="deepseek-v4-flash",
++                provider="opencode-go",
++                profile="coder",
++                parent_agent=self.parent,
++            )
++        result_data = json.loads(result)
++        self.assertEqual(result_data["results"][0]["status"], "completed")
++
++    @patch("tools.delegate_tool._resolve_delegation_credentials")
++    @patch("tools.delegate_tool._build_child_agent")
++    @patch("tools.delegate_tool._run_single_child")
++    def test_cross_profile_disabled_without_profile_succeeds(self, mock_run, mock_build, mock_resolve):
++        """When allow_cross_profile is false but no profile arg, existing path works."""
++        mock_resolve.return_value = {"model": None, "provider": None, "base_url": None,
++                                     "api_key": None, "api_mode": None, "request_overrides": None,
++                                     "max_output_tokens": None, "command": None, "args": None}
++        mock_child = MagicMock()
++        mock_child.session_prompt_tokens = 100
++        mock_child.session_completion_tokens = 50
++        mock_child.session_estimated_cost_usd = 0.01
++        mock_build.return_value = mock_child
++        mock_run.return_value = {"status": "completed", "summary": "done"}
++
++        with patch("tools.delegate_tool._load_config",
++                   return_value={"allow_cross_profile": False}):
++            result = delegate_task(
++                goal="Test no-profile still works",
++                model="deepseek-v4-flash",
++                parent_agent=self.parent,
++            )
++        result_data = json.loads(result)
++        self.assertEqual(result_data["results"][0]["status"], "completed")
++
++    @patch("tools.delegate_tool._resolve_delegation_credentials")
++    @patch("tools.delegate_tool._build_child_agent")
++    @patch("tools.delegate_tool._run_single_child")
++    def test_cross_profile_default_is_true(self, mock_run, mock_build, mock_resolve):
++        """When allow_cross_profile is not in config, default is true (backward compat)."""
++        mock_resolve.return_value = {"model": None, "provider": None, "base_url": None,
++                                     "api_key": None, "api_mode": None, "request_overrides": None,
++                                     "max_output_tokens": None, "command": None, "args": None}
++        mock_child = MagicMock()
++        mock_child.session_prompt_tokens = 100
++        mock_child.session_completion_tokens = 50
++        mock_child.session_estimated_cost_usd = 0.01
++        mock_build.return_value = mock_child
++        mock_run.return_value = {"status": "completed", "summary": "done"}
++
++        with patch("tools.delegate_tool._load_config",
++                   return_value={}):  # no allow_cross_profile key
++            result = delegate_task(
++                goal="Test default allows cross-profile",
++                model="deepseek-v4-flash",
++                provider="opencode-go",
++                profile="coder",
++                parent_agent=self.parent,
++            )
++        result_data = json.loads(result)
++        self.assertEqual(result_data["results"][0]["status"], "completed")
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 081184418..2b8e8ba3b 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -2459,6 +2459,19 @@ def delegate_task(
+     except ValueError as exc:
+         return tool_error(str(exc))
+ 
++    # Cross-profile guard: allow_cross_profile controls whether delegate_task
++    # accepts an explicit profile argument. When false, any caller-supplied
++    # profile is rejected. This is a security boundary for multi-profile
++    # deployments where profiles may hold credentials for different users or
++    # trust levels. Default is true (backward compatible, single-user default).
++    allow_cross_profile = cfg.get("allow_cross_profile", True)
++    if profile and not allow_cross_profile:
++        return tool_error(
++            "Cross-profile delegation is disabled by config. "
++            "Set delegation.allow_cross_profile: true in config.yaml to enable "
++            "profile overrides from within delegate_task."
++        )
++
+     # Per-call model/provider/profile override — applied before task building
+     # so all children in a batch inherit the same override. When model is set,
+     # resolves credentials from the specified profile's .env and config.yaml.
+@@ -3237,6 +3250,13 @@ def _resolve_per_call_credentials(
+     Compatible with the shape returned by _resolve_delegation_credentials
+     so the caller can swap the result in.
+ 
++    Security Note:
++        This function assumes all profiles are owned by the same user.
++        Cross-profile access is controlled by the ``delegation.allow_cross_profile``
++        config key (default: ``true``). Set it to ``false`` to prevent
++        delegate_task from accepting explicit profile arguments. In multi-tenant
++        deployments, additional authorization and audit logging are required.
++
+     Examples:
+         >>> _resolve_per_call_credentials(model="deepseek-v4-flash")
+         {...}  # model-only override, inherits parent's provider
+@@ -3257,10 +3277,8 @@ def _resolve_per_call_credentials(
+         profile_dir = hermes_home / "profiles" / profile
+         if not profile_dir.exists():
+             logger.warning(
+-                "Per-call override profile directory not found: %s. "
+-                "Falling back to default profile directories. "
+-                "Check that the profile name is correct and exists under ~/.hermes/profiles/.",
+-                profile_dir,
++                "Per-call override profile not found, falling back to default. "
++                "Verify the profile name exists under ~/.hermes/profiles/."
+             )
+             profile_dir = hermes_home
+     else:
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index be9b3a3f3..72f9518c7 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -1996,6 +1996,7 @@ delegation:
+   max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
+   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
+   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
++  allow_cross_profile: true                 # Allow delegate_task to resolve credentials from a non-default profile. true (default) enables cross-profile routing. false rejects explicit profile args.
+ ```
+ 
+ **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+@@ -2010,6 +2011,8 @@ The delegation provider uses the same credential resolution as CLI/gateway start
+ 
+ **Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
+ 
++**Cross-profile credential routing:** When per-call model/provider/profile overrides are enabled (PR #65008), `delegate_task` accepts an optional `profile` argument that resolves credentials from a named profile's `.env` and `config.yaml`. Set `allow_cross_profile: false` to prevent any caller-supplied profile from being honored — the agent will receive a tool error instead. This is a security boundary for multi-tenant deployments where profiles may hold credentials for different users or trust levels. Default is `true` (backward compatible, single-user default).
++
+ ## Clarify
+ 
+ Configure the clarification prompt behavior:
+-- 
+2.47.3
+
