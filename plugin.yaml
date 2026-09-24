@@ -1,5 +1,5 @@
 name: delegate-task-anywhere
 version: 0.1.0
-description: Policy-controlled in-process delegation across Hermes profiles, providers, and models
+description: Policy-controlled delegation across Hermes profiles, providers, and models
 provides_tools:
   - delegate_task_anywhere

@@ -11,5 +11,5 @@
 
 ### Verification
 
-- Added regression coverage for named-profile toolset preservation and the default-profile leaf allowlist.
-- The full pytest suite passes locally: 20 tests passed.
+- Added regression coverage for named-profile toolset preservation, the default-profile leaf allowlist, and Hermes helper signatures that omit optional keywords.
+- The full pytest suite passes locally: 21 tests passed.
