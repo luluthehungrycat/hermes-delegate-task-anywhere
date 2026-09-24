@@ -14,3 +14,4 @@
 - Added regression coverage for named-profile toolset preservation, the default-profile leaf allowlist, Hermes helper signatures that omit optional keywords, and nested CLI delegation at the configured depth limit.
 - Depth validation adds Hermes-local depth to the propagated CLI depth, preserving the limit across mixed native and CLI delegation.
 - The full pytest suite passes locally: 23 tests passed.
+- Hermes Agent v0.21.4 CLI smoke with the plugin enabled in `pilot-python-pro` returned the expected depth-limit error at a temporary `max_spawn_depth: 1`.
