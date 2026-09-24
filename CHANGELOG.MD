@@ -11,5 +11,6 @@
 
 ### Verification
 
-- Added regression coverage for named-profile toolset preservation, the default-profile leaf allowlist, and Hermes helper signatures that omit optional keywords.
-- The full pytest suite passes locally: 21 tests passed.
+- Added regression coverage for named-profile toolset preservation, the default-profile leaf allowlist, Hermes helper signatures that omit optional keywords, and nested CLI delegation at the configured depth limit.
+- Depth validation adds Hermes-local depth to the propagated CLI depth, preserving the limit across mixed native and CLI delegation.
+- The full pytest suite passes locally: 23 tests passed.
