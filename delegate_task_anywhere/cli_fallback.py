@@ -9,8 +9,8 @@ from typing import Any
 
 from .depth import DEPTH_ENV
 
-# The fallback is intentionally a leaf process. Keep useful tool categories,
-# but exclude the native delegation toolset and the plugin toolset.
+# Generic toolsets for the default-profile fallback only. Named profiles keep
+# their configured toolsets, which exclude delegation unless explicitly enabled.
 LEAF_TOOLSETS = (
     "web", "browser", "terminal", "file", "vision", "image_gen",
     "tts", "skills", "todo", "memory", "context_engine", "session_search",
@@ -47,10 +47,13 @@ def run_cli_fallback(
         "chat",
         "--provider", provider,
         "--model", model,
-        "-t", ",".join(LEAF_TOOLSETS),
-        "-Q",
-        "-q", prompt,
     ]
+    # Preserve an explicit named profile's SOUL.md and configured toolsets.
+    # The default profile still uses the generic leaf allowlist to avoid
+    # recursively exposing the plugin to its own fallback child.
+    if profile == "default":
+        argv.extend(["-t", ",".join(LEAF_TOOLSETS)])
+    argv.extend(["-Q", "-q", prompt])
     child_env = dict(environ or os.environ)
     child_env[DEPTH_ENV] = str(depth + 1)
     child_env["DELEGATE_TASK_ANYWHERE_BACKEND"] = "cli"

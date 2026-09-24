@@ -94,14 +94,14 @@ Batch tasks share one model/provider/profile override:
 
 ## Compatibility and depth limits
 
-The plugin uses a hybrid backend:
+The plugin uses two execution paths:
 
-1. It first attempts in-process delegation through Hermes' native child-agent primitives.
-2. A plugin-side runtime patch supplies the live `parent_agent` when the active host exposes it.
-3. If the parent context or native helper API is unavailable before a child starts, it falls back to an isolated one-shot Hermes CLI process using the requested profile, provider, and model.
-4. It never retries through the CLI after execution may have started, preventing duplicate work.
+1. Provider/model-only overrides use in-process delegation through Hermes' native child-agent primitives. A plugin-side runtime patch supplies the live `parent_agent` when the active host exposes it.
+2. Explicit named-profile overrides use an isolated one-shot Hermes CLI process so the selected profile's `SOUL.md`, toolsets, and configuration are loaded.
+3. If the parent context or native helper API is unavailable before a child starts, it uses the same isolated CLI fallback.
+4. It never retries through the CLI after in-process execution may have started, preventing duplicate work.
 
-The fallback invokes Hermes with an argument list and propagates a private depth marker through the child environment. Credentials remain profile-resolved and are never placed in command-line arguments.
+The fallback invokes Hermes with an argument list and propagates a private depth marker through the child environment. Credentials remain profile-resolved and are never placed in command-line arguments. For named profiles it leaves tool selection to that profile's configuration; the `default` profile uses a generic leaf tool allowlist that excludes delegation tools and this plugin.
 
 The plugin reads Hermes' native `delegation.max_spawn_depth` setting and enforces it on both backends. This extra plugin-side check is required because the in-process compatibility adapter calls native private helpers directly, while a fresh CLI process otherwise starts with a new depth counter. `delegation.max_concurrent_children` and `delegation.max_iterations` are also reused where available.
 
@@ -110,6 +110,8 @@ If Hermes' internal API changes, the plugin falls back only for pre-dispatch com
 ## Compatibility internals
 
 The plugin deliberately depends on native, non-public delegation helpers. At startup/use it checks for the required functions and fails with a clear compatibility error if a Hermes update changes them.
+
+The adapter inspects `_build_child_agent` before calling it and omits optional arguments that the installed Hermes version does not accept. This keeps the adapter compatible when Hermes changes private helper signatures (for example, removing `override_max_tokens`).
 
 The checked integration points are:
 
@@ -121,15 +123,17 @@ The checked integration points are:
 - `hermes_cli.runtime_provider.resolve_runtime_provider`
 - `hermes_constants.set_hermes_home_override`
 
-Tested against Hermes Agent `v0.19.0 (2026.7.20)`.
+Tested against Hermes Agent `v0.21.4 (2026.9.21)`.
 
 ## Development
 
+Run the tests from the repository root with pytest installed:
+
 ```bash
-/home/hermes/.hermes/hermes-agent/venv/bin/python3 -m pytest
+PYTHONPATH=. pytest -p no:cacheprovider
 ```
 
-The tests cover policy enforcement, strict profile resolution, native fallback routing, extended-runner argument construction, and plugin registration.
+The tests cover policy enforcement, strict profile resolution, profile-aware fallback routing, extended-runner argument construction, and plugin registration. The plugin uses private Hermes delegation helpers, so verify it against the Hermes version you deploy.
 
 ## License
 

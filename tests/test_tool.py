@@ -53,21 +53,25 @@ def test_handler_rejects_profile_without_provider() -> None:
     assert "profile override requires an explicit provider" in json.loads(result)["error"]
 
 
-def test_handler_runs_extended_path_with_allowlisted_target_profile(tmp_path: Path) -> None:
+def test_handler_uses_target_profile_cli_to_load_its_prompt_and_toolsets(tmp_path: Path) -> None:
     (tmp_path / "profiles" / "coder").mkdir(parents=True)
-    fake = FakeExtendedDelegator()
+    calls = {}
+
+    def cli_fallback(**kwargs):
+        calls.update(kwargs)
+        return {"ok": True, "backend": "cli", "result": "profile loaded"}
 
     result = handle_delegate_task_anywhere(
         {"goal": "review", "model": "target-model", "provider": "mistral", "profile": "coder"},
         parent_agent=SimpleNamespace(provider="parent-provider"),
         hermes_root=tmp_path,
         policy_config={"allowed_profiles": ["coder"], "allowed_providers": ["mistral"]},
-        credential_resolver=lambda **kwargs: {"model": kwargs["model"], "provider": kwargs["provider"]},
-        extended_delegator=fake,
+        cli_fallback=cli_fallback,
     )
 
-    assert json.loads(result)["results"][0]["summary"] == "ok"
-    assert fake.received["credentials"] == {"model": "target-model", "provider": "mistral"}
+    assert json.loads(result)["backend"] == "cli"
+    assert calls["profile"] == "coder"
+    assert calls["model"] == "target-model"
 
 
 def test_handler_rejects_plugin_delegation_at_native_depth_limit(tmp_path: Path) -> None:
@@ -128,10 +132,10 @@ def test_handler_does_not_cli_fallback_after_started_error(tmp_path: Path) -> No
         return {"ok": True}
 
     result = handle_delegate_task_anywhere(
-        {"goal": "no duplicate", "model": "target", "provider": "mistral", "profile": "coder"},
+        {"goal": "no duplicate", "model": "target", "provider": "mistral"},
         parent_agent=SimpleNamespace(_delegate_depth=0),
         hermes_root=tmp_path,
-        policy_config={"allowed_profiles": ["coder"], "allowed_providers": ["mistral"]},
+        policy_config={"allowed_profiles": ["default"], "allowed_providers": ["mistral"]},
         credential_resolver=lambda **kwargs: {"model": kwargs["model"], "provider": kwargs["provider"]},
         extended_delegator=StartedFailure(),
         cli_fallback=cli_fallback,
