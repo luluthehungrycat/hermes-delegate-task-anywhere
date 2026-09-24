@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib
+import inspect
 import time
 from typing import Any, Mapping
 
@@ -69,25 +70,36 @@ class ExtendedDelegator:
                 if not goal:
                     raise ValueError(f"Task {index} is missing a goal")
                 role = self._delegate._normalize_role(task.get("role"))
-                child = self._delegate._build_child_agent(
-                    task_index=index,
-                    goal=goal,
-                    context=task.get("context"),
-                    toolsets=None,
-                    model=credentials.get("model"),
-                    max_iterations=max_iterations,
-                    task_count=len(tasks),
-                    parent_agent=parent_agent,
-                    override_provider=credentials.get("provider"),
-                    override_base_url=credentials.get("base_url"),
-                    override_api_key=credentials.get("api_key"),
-                    override_api_mode=credentials.get("api_mode"),
-                    override_request_overrides=credentials.get("request_overrides"),
-                    override_max_tokens=credentials.get("max_output_tokens"),
-                    override_acp_command=credentials.get("command"),
-                    override_acp_args=credentials.get("args"),
-                    role=role,
+                build_kwargs = {
+                    "task_index": index,
+                    "goal": goal,
+                    "context": task.get("context"),
+                    "toolsets": None,
+                    "model": credentials.get("model"),
+                    "max_iterations": max_iterations,
+                    "task_count": len(tasks),
+                    "parent_agent": parent_agent,
+                    "override_provider": credentials.get("provider"),
+                    "override_base_url": credentials.get("base_url"),
+                    "override_api_key": credentials.get("api_key"),
+                    "override_api_mode": credentials.get("api_mode"),
+                    "override_request_overrides": credentials.get("request_overrides"),
+                    "override_max_tokens": credentials.get("max_output_tokens"),
+                    "override_acp_command": credentials.get("command"),
+                    "override_acp_args": credentials.get("args"),
+                    "role": role,
+                }
+                signature = inspect.signature(self._delegate._build_child_agent)
+                accepts_kwargs = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
                 )
+                if not accepts_kwargs:
+                    build_kwargs = {
+                        key: value for key, value in build_kwargs.items()
+                        if key in signature.parameters
+                    }
+                child = self._delegate._build_child_agent(**build_kwargs)
                 child._delegate_saved_tool_names = parent_tool_names
                 children.append((index, task, child))
         finally:

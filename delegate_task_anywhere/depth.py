@@ -31,11 +31,16 @@ def max_spawn_depth(config: Mapping[str, Any] | None = None) -> int:
 
 
 def current_depth(parent_agent: Any = None, environ: Mapping[str, str] | None = None) -> int:
-    """Get depth from the live parent, or the propagated CLI environment marker."""
-    if parent_agent is not None:
-        raw = getattr(parent_agent, "_delegate_depth", 0)
-    else:
-        raw = (environ or os.environ).get(DEPTH_ENV, "0")
+    """Combine Hermes-local depth with the depth inherited across CLI turns."""
+    environment = os.environ if environ is None else environ
+    environment_depth = _parse_depth(environment.get(DEPTH_ENV, "0"))
+    if parent_agent is None:
+        return environment_depth
+    native_depth = _parse_depth(getattr(parent_agent, "_delegate_depth", 0))
+    return native_depth + environment_depth
+
+
+def _parse_depth(raw: Any) -> int:
     try:
         depth = int(raw)
     except (TypeError, ValueError) as exc:

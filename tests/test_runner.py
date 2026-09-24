@@ -68,3 +68,50 @@ def test_extended_delegator_returns_input_order_for_parallel_batch() -> None:
     )
 
     assert [entry["task_index"] for entry in result["results"]] == [0, 1]
+
+
+class FixedSignatureDelegate(FakeDelegateModule):
+    def _build_child_agent(
+        self,
+        task_index,
+        goal,
+        context,
+        toolsets,
+        model,
+        max_iterations,
+        task_count,
+        parent_agent,
+        override_provider,
+    ):
+        self.built.append({
+            "task_index": task_index,
+            "goal": goal,
+            "context": context,
+            "toolsets": toolsets,
+            "model": model,
+            "max_iterations": max_iterations,
+            "task_count": task_count,
+            "parent_agent": parent_agent,
+            "override_provider": override_provider,
+        })
+        return SimpleNamespace()
+
+
+def test_extended_delegator_filters_kwargs_missing_from_hermes_signature() -> None:
+    module = FixedSignatureDelegate()
+    delegator = ExtendedDelegator(delegate_module=module)
+
+    result = delegator.run(
+        parent_agent=SimpleNamespace(model="parent-model"),
+        tasks=[{"goal": "inspect"}],
+        credentials={
+            "model": "target-model",
+            "provider": "mistral",
+            "max_output_tokens": 256,
+        },
+    )
+
+    assert result["results"][0]["status"] == "completed"
+    assert module.built[0]["model"] == "target-model"
+    assert module.built[0]["override_provider"] == "mistral"
+    assert "override_max_tokens" not in module.built[0]

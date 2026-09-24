@@ -107,7 +107,12 @@ def handle_delegate_task_anywhere(
         depth, _ = validate_depth(parent_agent, config=effective_config)
 
         fallback = cli_fallback or run_cli_fallback
-        if parent_agent is None:
+        # A named profile owns its SOUL.md and toolsets. The native in-process
+        # helper inherits the caller's prompt/tool capabilities, so it cannot
+        # faithfully execute a profile-specific role. Use an isolated CLI turn
+        # for explicit profile selection; retain the native fast path for
+        # provider/model-only overrides.
+        if parent_agent is None or target_profile != "default":
             result = fallback(
                 profile=target_profile,
                 provider=provider.strip(),
